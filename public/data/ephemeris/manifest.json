@@ -1,0 +1,42 @@
+{
+  "generatedAt": "2026-10-14T19:33:13.620Z",
+  "generator": "preprocessing/fetch_horizons.js",
+  "bundles": [
+    {
+      "id": "horizons-default",
+      "file": "snapshot.json",
+      "provider": "NASA/JPL Horizons System (vector ephemerides)",
+      "api": "https://ssd-api.jpl.nasa.gov/doc/horizons.html",
+      "retrievedAt": "2026-10-14T19:33:13.620Z",
+      "requestedRange": {
+        "start": "2026-09-15T00:00:00Z",
+        "stop": "2026-12-15T00:00:00Z",
+        "step": "6h"
+      },
+      "step": "6h",
+      "frame": "ICRF/J2000, ecliptic reference plane, heliocentric for the Sun and planets",
+      "units": {
+        "position": "km",
+        "velocity": "km/s"
+      },
+      "bodies": [
+        "Sun",
+        "Mercury",
+        "Venus",
+        "Earth",
+        "Mars",
+        "Jupiter",
+        "Saturn",
+        "Uranus",
+        "Neptune",
+        "Moon",
+        "Io",
+        "Europa",
+        "Ganymede",
+        "Callisto",
+        "Titan"
+      ],
+      "steps": 365
+    }
+  ]
+}
