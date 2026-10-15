@@ -873,7 +873,18 @@ export class SolarScene {
    * Draw a route. `pathKm` are Earth-centred or heliocentric kilometres as
    * produced by the mission graph; `frame` says which.
    */
-  drawRoute(pathKm: THREE.Vector3[], exploredKm: THREE.Vector3[], frame: 'earth' | 'helio', label?: string): void {
+  /**
+   * Draw a route. `pathKm` are Earth-centred kilometres (the mission graph's
+   * frame for every node), `hazards` are the keep-out spheres that were screened
+   * so the viewer can see what the search had to route around.
+   */
+  drawRoute(
+    pathKm: THREE.Vector3[],
+    exploredKm: THREE.Vector3[],
+    frame: 'earth' | 'helio' = 'earth',
+    hazards?: { positionKm: { x: number; y: number; z: number }; name: string; missDistanceKm: number }[],
+    keepOutKm = 0,
+  ): void {
     this.clearRoute();
     if (pathKm.length < 2) return;
     const earthHelio = this.helio.get('Earth') ?? new THREE.Vector3();
@@ -894,6 +905,32 @@ export class SolarScene {
     this.routeLines.push(line);
     this.routeGroup.add(line);
 
+    // Keep-out spheres for the objects the search had to consider.
+    if (hazards && hazards.length > 0 && keepOutKm > 0) {
+      const near = hazards
+        .slice()
+        .sort((a, b) => a.missDistanceKm - b.missDistanceKm)
+        .slice(0, 40);
+      const radiusUnits = keepOutKm * this.kmPerUnit;
+      for (const h of near) {
+        if (radiusUnits <= 0) break;
+        const sphere = new THREE.Mesh(
+          new THREE.SphereGeometry(Math.max(1, radiusUnits), 10, 8),
+          new THREE.MeshBasicMaterial({
+            color: 0xf87171,
+            wireframe: true,
+            transparent: true,
+            opacity: h.missDistanceKm < keepOutKm ? 0.5 : 0.16,
+            depthWrite: false,
+          }),
+        );
+        sphere.position.set(h.positionKm.x, h.positionKm.y, h.positionKm.z).multiplyScalar(this.kmPerUnit);
+        this.routeLines.push(sphere as unknown as THREE.Line);
+        this.routeGroup.add(sphere);
+        void h;
+      }
+    }
+
     pts.forEach((p, i) => {
       const isStart = i === 0;
       const isEnd = i === pts.length - 1;
@@ -905,7 +942,6 @@ export class SolarScene {
       this.waypointMarkers.push(m);
       this.waypointGroup.add(m);
     });
-    void label;
 
     if (exploredKm.length > 0) {
       const arr: number[] = [];
@@ -940,7 +976,7 @@ export class SolarScene {
       return new THREE.Vector3(v.x, v.y, v.z);
     });
     // Reuse drawRoute with the Earth-centred frame.
-    this.drawRoute(pts, [], 'earth', 'D* Lite route');
+    this.drawRoute(pts, [], 'earth');
   }
 
   markOrigin(km: THREE.Vector3): void {

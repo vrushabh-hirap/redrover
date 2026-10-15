@@ -64,7 +64,7 @@ describe('mission navigation graph', () => {
       catalogStates: [],
       cost: costModel('balanced'),
     });
-    expect(g.node(`park:${PARKING_SHELLS[0]}:0`)).toBeDefined();
+    expect(g.node(`park:${PARKING_SHELLS[0]}:0:2`)).toBeDefined();
     expect(g.neighbours(g.node('site:KSC')!).length).toBeGreaterThan(0);
     expect(g.stats.nodes).toBeGreaterThan(60);
     expect(g.stats.edges).toBeGreaterThan(100);
@@ -118,7 +118,7 @@ describe('mission navigation graph', () => {
       cost: costModel('balanced'),
     });
     const from = g.node('site:KSC')!;
-    const to = g.node('park:250:0')!;
+    const to = g.node('park:250:0:2')!;
     const mid = {
       x: (from.positionKm.x + to.positionKm.x) / 2,
       y: (from.positionKm.y + to.positionKm.y) / 2,
@@ -204,10 +204,121 @@ describe('static search algorithms over the mission graph', () => {
   });
 
   it('the heuristic never exceeds the true remaining cost (admissibility)', () => {
+    for (const model of ['fuel', 'time', 'risk', 'balanced'] as const) {
+      const g = build(model);
+      const t = g.node('sat:25544')!;
+      for (const n of g.allNodes()) {
+        const truth = planUCS(g, n, t);
+        if (!truth.found) continue;
+        expect(heuristic(n, t, g.cost, g), `${model}: ${n.id}`).toBeLessThanOrEqual(
+          truth.metrics.pathCost + 1e-6,
+        );
+      }
+    }
+  });
+
+  it('the heuristic is exact at the goal and zero at the start of an equal-cost hop', () => {
     const g = build('balanced');
-    const s = g.node('site:KSC')!;
     const t = g.node('sat:25544')!;
-    const truth = planUCS(g, s, t).metrics.pathCost;
-    expect(heuristic(s, t, g.cost)).toBeLessThanOrEqual(truth + 1e-6);
+    expect(heuristic(t, t, g.cost, g)).toBe(0);
+    expect(heuristic(g.node('site:KSC')!, t, g.cost, g)).toBeGreaterThan(0);
+  });
+});
+
+describe('keep-out screening', () => {
+  const build = (keepOutKm: number, hazardAt?: (mid: { x: number; y: number; z: number }) => { x: number; y: number; z: number }) =>
+    new MissionGraph({
+      origin: site('KSC', 28.57, -80.64),
+      destination: moon(),
+      bodies: {},
+      catalogStates: hazardAt ? [{ noradId: 42, name: 'HAZARD-42', positionKm: hazardAt({ x: 0, y: 0, z: 0 }) }] : [],
+      cost: costModel('balanced'),
+      options: { keepOutKm, hazardSampleCap: 5_000 },
+    });
+
+  /** Midpoints of every edge in a graph, for hazard placement. */
+  const edgeMidpoints = (g: MissionGraph) => {
+    const out: { x: number; y: number; z: number }[] = [];
+    for (const n of g.allNodes()) {
+      for (const e of g.neighbours(n)) {
+        out.push({
+          x: (n.positionKm.x + e.to.positionKm.x) / 2,
+          y: (n.positionKm.y + e.to.positionKm.y) / 2,
+          z: (n.positionKm.z + e.to.positionKm.z) / 2,
+        });
+      }
+    }
+    return out;
+  };
+
+  it('a larger keep-out radius blocks strictly more edges', () => {
+    // Hazards are placed on real edge midpoints so the screen actually bites.
+    const midpoints = edgeMidpoints(build(25));
+    const counts = [25, 75, 150, 300].map((km) =>
+      new MissionGraph({
+        origin: site('KSC', 28.57, -80.64),
+        destination: moon(),
+        bodies: {},
+        catalogStates: midpoints.map((p, i) => ({ noradId: 700 + i, name: `H-${i}`, positionKm: p })),
+        cost: costModel('balanced'),
+        options: { keepOutKm: km, hazardSampleCap: 5_000 },
+      }).stats.blockedEdges,
+    );
+    for (let i = 1; i < counts.length; i++) {
+      expect(counts[i], `${counts.join(',')}`).toBeGreaterThanOrEqual(counts[i - 1]);
+    }
+    expect(counts[counts.length - 1]).toBeGreaterThan(0);
+  });
+
+  it('the planner routes around a blocked edge instead of stepping onto it', () => {
+    // Drop hazards on the midpoints of the three edges that leave the 800 km
+    // shell the graph would otherwise prefer.
+    const base = build(25);
+    const from = base.node('park:800:2:2')!;
+    const targets = base.neighbours(from).slice(0, 3);
+    const mids = targets.map((e) => ({
+      x: (from.positionKm.x + e.to.positionKm.x) / 2,
+      y: (from.positionKm.y + e.to.positionKm.y) / 2,
+      z: (from.positionKm.z + e.to.positionKm.z) / 2,
+    }));
+    const g = new MissionGraph({
+      origin: site('KSC', 28.57, -80.64),
+      destination: moon(),
+      bodies: {},
+      catalogStates: mids.map((p, i) => ({ noradId: 800 + i, name: `H-${i}`, positionKm: p })),
+      cost: costModel('balanced'),
+      options: { keepOutKm: 120, hazardSampleCap: 5_000 },
+    });
+    expect(g.neighbours(g.node('park:800:2:2')!).filter((e) => e.blocked).length).toBe(3);
+    const blocked = g
+      .allNodes()
+      .filter((n) => n.kind === 'park')
+      .filter((n) => g.neighbours(n).some((e) => e.blocked));
+    expect(blocked.length).toBeGreaterThan(0);
+    const res = planAStar(g, g.node('site:KSC')!, g.node('moon:Moon')!);
+    expect(res.found).toBe(true);
+    expect(res.metrics.clearedObstacles).toBe(true);
+    // The route must not step onto a blocked edge.
+    for (let i = 0; i < res.path.length - 1; i++) {
+      const e = g.neighbours(res.path[i]).find((x) => x.to.id === res.path[i + 1].id);
+      expect(e?.blocked, `${res.path[i].id} → ${res.path[i + 1].id}`).toBeFalsy();
+    }
+  });
+
+  it('hazard records carry the object name and the miss distance', () => {
+    const mids = edgeMidpoints(build(25));
+    const g = new MissionGraph({
+      origin: site('KSC', 28.57, -80.64),
+      destination: moon(),
+      bodies: {},
+      catalogStates: mids.map((p, i) => ({ noradId: 900 + i, name: `H-${i}`, positionKm: p })),
+      cost: costModel('balanced'),
+      options: { keepOutKm: 300, hazardSampleCap: 5_000 },
+    });
+    expect(g.hazards.length).toBeGreaterThan(0);
+    const worst = g.hazards.reduce((a, b) => (b.missDistanceKm < a.missDistanceKm ? b : a));
+    expect(worst.name).toMatch(/^H-\d+$/);
+    expect(worst.missDistanceKm).toBeGreaterThanOrEqual(0);
+    expect(worst.edge).toContain('→');
   });
 });

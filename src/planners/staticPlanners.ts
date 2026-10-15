@@ -75,6 +75,8 @@ export interface PlanMetrics {
   minMissKm: number;
   /** True when no edge of the route is flagged as blocked. */
   clearedObstacles: boolean;
+  /** How many edges of the route were rejected by keep-out screening. */
+  blockedEdgesSkipped: number;
   optimality: string;
 }
 
@@ -137,6 +139,7 @@ function metricsOf(
     edgeCount: Math.max(0, path.length - 1),
     minMissKm: minMiss === Infinity ? -1 : Number(minMiss.toFixed(1)),
     clearedObstacles: reachable && cleared,
+    blockedEdgesSkipped: graph.stats.blockedEdges,
     optimality: ALGORITHMS[algo].optimality,
   };
 }
@@ -160,6 +163,7 @@ function emptyResult(graph: MissionGraph, algo: AlgorithmId): PlanResult {
       edgeCount: 0,
       minMissKm: -1,
       clearedObstacles: false,
+      blockedEdgesSkipped: 0,
       optimality: ALGORITHMS[algo].optimality,
     },
   };
@@ -216,7 +220,7 @@ const byKey = (key: (n: MissionNode) => [number, number]) => (a: MissionNode, b:
 
 export function planAStar(graph: MissionGraph, start: MissionNode, goal: MissionNode): PlanResult {
   const t0 = performance.now();
-  const h = (n: MissionNode) => heuristic(n, goal, graph.cost);
+  const h = (n: MissionNode) => heuristic(n, goal, graph.cost, graph);
   const g = new Map<string, number>([[start.id, 0]]);
   const parent = new Map<string, MissionNode>();
   const closed = new Set<string>();
@@ -304,7 +308,7 @@ export function planUCS(graph: MissionGraph, start: MissionNode, goal: MissionNo
 
 export function planGreedy(graph: MissionGraph, start: MissionNode, goal: MissionNode): PlanResult {
   const t0 = performance.now();
-  const h = (n: MissionNode) => heuristic(n, goal, graph.cost);
+  const h = (n: MissionNode) => heuristic(n, goal, graph.cost, graph);
   const parent = new Map<string, MissionNode>();
   const closed = new Set<string>();
   const explored: MissionNode[] = [];

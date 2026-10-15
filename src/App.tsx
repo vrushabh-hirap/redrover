@@ -43,10 +43,12 @@ import {
 import {
   COST_MODELS,
   CostModelId,
+  KEEP_OUT_CHOICES,
   MissionGraph,
   MissionNode,
   costModel,
   sitePositionKm,
+  DEFAULT_GRAPH_OPTIONS,
 } from './core/missionGraph';
 import { DStarLite, DStarSnapshot, OrbitGridSpec, cellCentre } from './planners/dStarLite';
 
@@ -115,6 +117,7 @@ export const App: React.FC = () => {
   const [destination, setDestination] = useState<DestinationState | null>(null);
   const [algorithm, setAlgorithm] = useState<AlgorithmId>('astar');
   const [costModelId, setCostModelId] = useState<CostModelId>('balanced');
+  const [keepOutKm, setKeepOutKm] = useState<number>(DEFAULT_GRAPH_OPTIONS.keepOutKm);
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [compare, setCompare] = useState<PlanResult[] | null>(null);
   const [planning, setPlanning] = useState(false);
@@ -143,9 +146,7 @@ export const App: React.FC = () => {
   const [dstarReport, setDstarReport] = useState<{
     replans: number; changedEdges: number; expandedInRepair: number; pathCost: number; pathLength: number; wallMs: number;
   } | null>(null);
-  // Two snapshots: the initial one (the deterministic replay point) and the
-  // latest one (shown in the manifest / used for inspection).
-  const [dstarSnapshot, setDstarSnapshot] = useState<DStarSnapshot | null>(null);
+  // The initial snapshot is the deterministic replay point.
   const [dstarInitialSnapshot, setDstarInitialSnapshot] = useState<DStarSnapshot | null>(null);
   const dstarRef = useRef<DStarLite | null>(null);
   const dstarPropRef = useRef<Sgp4Propagator | null>(null);
@@ -424,8 +425,14 @@ export const App: React.FC = () => {
         })(),
       };
     }
+    // Mission-graph nodes are Earth-centred: a body destination's position is
+    // its heliocentric vector minus Earth's.
     const st = ephem[destination.name];
-    const pos = st ? { x: st.position.x, y: st.position.y, z: st.position.z } : { x: 0, y: 0, z: 0 };
+    const earth = ephem.Earth;
+    const pos =
+      st && earth
+        ? { x: st.position.x - earth.position.x, y: st.position.y - earth.position.y, z: st.position.z - earth.position.z }
+        : { x: 0, y: 0, z: 0 };
     return {
       id: `body:${destination.name}`,
       name: destination.name,
@@ -457,8 +464,9 @@ export const App: React.FC = () => {
       bodies: Object.fromEntries(Object.entries(ephem).map(([k, v]) => [k, v.position])),
       catalogStates: hazardStates,
       cost: costModel(costModelId),
+      options: { keepOutKm },
     });
-  }, [originNode, destinationNode, ephem, hazardStates, costModelId]);
+  }, [originNode, destinationNode, ephem, hazardStates, costModelId, keepOutKm]);
 
   const runPlanner = useCallback(
     (algo: AlgorithmId) => {
@@ -473,7 +481,9 @@ export const App: React.FC = () => {
             sceneRef.current?.drawRoute(
               result.path.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z)),
               result.explored.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z)),
-              destinationNode.kind === 'sat' ? 'earth' : 'helio',
+              'earth',
+              missionGraph.hazards,
+              keepOutKm,
             );
           } else {
             sceneRef.current?.clearRoute();
@@ -506,7 +516,7 @@ export const App: React.FC = () => {
         setPlanning(false);
       }
     }, 16);
-  }, [missionGraph, originNode, destinationNode, algorithm]);
+  }, [missionGraph, originNode, destinationNode, algorithm, keepOutKm]);
 
   // ── traffic / D* ───────────────────────────────────────────────────────
   const startDStar = useCallback(() => {
@@ -539,7 +549,6 @@ export const App: React.FC = () => {
       pathLength: path.length,
       wallMs: 0,
     });
-    setDstarSnapshot(dstar.snapshot());
     setDstarInitialSnapshot(dstar.snapshot());
     void subset;
   }, [catalog, simDate]);
@@ -579,7 +588,6 @@ export const App: React.FC = () => {
     sceneRef.current?.drawCellPath(cells);
     setDstarReport({ ...report });
     setDstarEvents(dstar.events_.slice(-60).map((e) => ({ ...e })));
-    setDstarSnapshot(dstar.snapshot());
   }, [catalog]);
 
   const stepDStar = useCallback(() => {
@@ -889,6 +897,18 @@ export const App: React.FC = () => {
           costModel={costModelId}
           onCostModel={(id) => setCostModelId(id as CostModelId)}
           costModels={COST_MODELS.map((m) => ({ id: m.id, label: m.label, description: m.description }))}
+          keepOutKm={keepOutKm}
+          onKeepOutKm={setKeepOutKm}
+          keepOutChoices={[...KEEP_OUT_CHOICES]}
+          hazardInfo={
+            missionGraph
+              ? {
+                  screened: missionGraph.stats.screenedObjects,
+                  blockedEdges: missionGraph.stats.blockedEdges,
+                  graphEdges: missionGraph.stats.edges,
+                }
+              : null
+          }
           onPlan={() => runPlanner(algorithm)}
           onCompareAll={runCompare}
           planning={planning}
@@ -1028,6 +1048,7 @@ export const App: React.FC = () => {
             costModel={costModel(costModelId)}
             originName={origin?.name ?? '—'}
             destinationName={destination?.name ?? '—'}
+            missionGraph={missionGraph}
           />
         )}
 
@@ -1048,7 +1069,8 @@ const PlanSummary: React.FC<{
   costModel: { label: string; description: string };
   originName: string;
   destinationName: string;
-}> = ({ plan, compare, graphVersion, costModel, originName, destinationName }) => {
+  missionGraph: MissionGraph | null;
+}> = ({ plan, compare, graphVersion, costModel, originName, destinationName, missionGraph }) => {
   return (
     <section
       aria-label="Route result"
@@ -1082,6 +1104,12 @@ const PlanSummary: React.FC<{
         <Stat label="Plan time" value={`${plan.metrics.planningTimeMs.toFixed(2)} ms`} color="var(--traffic)" />
         <Stat label="Peak frontier" value={fmt(plan.metrics.peakFrontier)} color="var(--accent)" />
         <Stat label="Min miss" value={plan.metrics.minMissKm > 0 ? `${fmt(plan.metrics.minMissKm)} km` : '—'} color="var(--bad)" />
+      </div>
+      <div className="note">
+        <strong>Obstacle screening.</strong> {missionGraph
+          ? `${missionGraph.stats.screenedObjects} cataloged objects screened · ${missionGraph.stats.blockedEdges} of ${missionGraph.stats.edges} graph edges inside the keep-out radius · ${plan.metrics.clearedObstacles ? 'route clears every keep-out sphere' : 'route clips a keep-out sphere'}.`
+          : 'No catalog loaded, so no obstacles were screened.'}
+        {' '}Keep-out spheres drawn in the scene are the volumes the search had to route around.
       </div>
       {plan.found ? (
         <ol style={{ margin: 0, paddingLeft: 16, fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.7 }}>

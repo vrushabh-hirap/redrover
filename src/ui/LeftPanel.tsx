@@ -43,6 +43,10 @@ export interface LeftPanelProps {
   costModel: string;
   onCostModel: (id: string) => void;
   costModels: { id: string; label: string; description: string }[];
+  keepOutKm: number;
+  onKeepOutKm: (km: number) => void;
+  keepOutChoices: number[];
+  hazardInfo: { screened: number; blockedEdges: number; graphEdges: number } | null;
   onPlan: () => void;
   onCompareAll: () => void;
   planning: boolean;
@@ -243,6 +247,39 @@ export const LeftPanel: React.FC<LeftPanelProps> = (p) => {
               <div className="note" style={{ marginTop: 7 }}>
                 {p.costModels.find((m) => m.id === p.costModel)?.description}
               </div>
+            </div>
+
+            <div>
+              <h3 className="section-title">Keep-out screening radius</h3>
+              <div className="chip-grid">
+                {p.keepOutChoices.map((km) => (
+                  <button
+                    key={km}
+                    className="chip"
+                    aria-pressed={p.keepOutKm === km}
+                    onClick={() => p.onKeepOutKm(km)}
+                  >
+                    {km} km
+                  </button>
+                ))}
+              </div>
+              <p style={{ fontSize: 9, color: 'var(--text-faint)', margin: '5px 0 0', lineHeight: 1.6 }}>
+                Every graph edge is screened against SGP4-propagated cataloged objects; larger radii
+                block more edges and force the search to detour around them. Red spheres in the scene
+                are the keep-out volumes that were considered.
+              </p>
+              {p.hazardInfo && (
+                <dl className="kv" style={{ marginTop: 6 }}>
+                  <dt>Objects screened</dt>
+                  <dd>{p.hazardInfo.screened}</dd>
+                  <dt>Graph edges</dt>
+                  <dd>{p.hazardInfo.graphEdges}</dd>
+                  <dt>Blocked by keep-out</dt>
+                  <dd style={{ color: p.hazardInfo.blockedEdges > 0 ? '#fca5a5' : 'var(--good)' }}>
+                    {p.hazardInfo.blockedEdges}
+                  </dd>
+                </dl>
+              )}
             </div>
 
             <div className="btn-row">

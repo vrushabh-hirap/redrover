@@ -137,7 +137,7 @@ real catalog. The inspector shows altitude 418–420 km, period 93.0 min,
 inclination 51.63°, element epoch 2026-10-13, a TEME position, provider
 `CelesTrak (elements originate from the US Space Force / Space-Track catalog)`
 and `SGP4-propagated from catalog elements`. Earth focus renders **371** objects
-(matching the loaded count) and a one-hour time step moves them **~12,200 km**,
+(matching the loaded count, de-duplicated by NORAD id) and a one-hour time step moves them **~12,200 km**,
 which is exactly the ISS orbital arc — the positions are real. The Catalog panel
 reports loaded / visible / hidden counts and honours type, region and name
 filters.
@@ -194,18 +194,31 @@ panel is labelled `EDUCATIONAL MODEL — collision avoidance and transfer dynami
 are simplified; this is not a conjunction assessment`.
 
 ### Scenario 7 — Responsive visual and performance pass
-**PASS.** Layout measured at 1000 × 700 and, via a same-origin probe page, at
-390 × 780. No element is clipped or overflows the viewport in any of the four
-panel states (default, inspector open, data panel open, traffic panel open).
-Verified: no `.topbar`/`.panel`/`.inspector`/`.timebar`/`.traffic-panel` overflow,
-and `overflowingCount: 0`. Controls carry accessible names, `aria-pressed` /
-`aria-selected` / `role="switch"` states and visible focus outlines.
+**PASS.** Layout measured at 1000 × 700 (desktop automation viewport) and, via a
+same-origin probe page that embeds the app in a 390 × 780 iframe, at phone width.
+Four panel states were measured in each size (default, inspector open, data
+panel open, traffic panel open):
 
-Performance: 371 objects, one `Points` draw call, one RAF loop. Scene updates
-happen on epoch or filter changes rather than per frame; a repair of 42
-expansions takes well under a millisecond of planning time and the reported
-repair wall time was 188 ms for a 5,491-cell repair. Work remains on the main
-thread for housekeeping under ~1 ms per tick.
+| Size | Result |
+|---|---|
+| 1000 × 700 | `.topbar` 1000×52, `.panel` 300×570, `.timebar` 683×46 — nothing clipped |
+| 390 × 780 | `.modeswitch` moves below the top bar, `.panel` full width, `.timebar` spans the width, `.inspector` / `.data-panel` / `.traffic-panel` full width — `overflowingCount: 0`, `clipped: false` for every measured element |
+
+Controls carry accessible names, `aria-pressed` / `aria-selected` states,
+`role="switch"` on the layer toggles, and visible focus outlines.
+
+Label placement is collision-checked against the **rendered CSS box size**,
+measured with a canvas text metric (including the `0.06em` letter-spacing)
+rather than a character estimate. Final overview result: **15 of 15 labels
+placed, 0 overlapping pairs, 0 off-screen**. Labels of the focused system's moons
+are prioritised, crowded bodies fall back to progressively further offsets, and
+only then is a label hidden.
+
+Performance: 371 objects, one `Points` draw call, one RAF loop, label publication
+throttled to ~12 Hz, all data fetching outside the loop. A D\* repair over 4,556
+changed cells consumed 1,628 shortest-path expansions and completed in under
+200 ms of wall time. Scene transforms are recomputed only when the epoch or the
+filter set changes, not per frame.
 
 ### Scenario 8 — Data provenance and replay
 **PASS.** Setting the epoch to 2027-07-04 produces both warnings:
@@ -230,8 +243,9 @@ There is no NASA badge on the CelesTrak catalog.
 | Command | Result |
 |---|---|
 | `npx tsc -b` | clean (no errors) |
-| `npm run build` | built in 384 ms; `dist/assets/index-*.js` 901 kB (250 kB gzip) |
+| `npm run build` | built in 384 ms (first pass); 215 ms after cleanup |
 | `npx vitest run` | **5 files, 50 tests, all passing** |
+| `npm run build` (final) | built in 215 ms; `dist/assets/index-*.js` 902 kB (251 kB gzip) |
 | `npx oxlint` | warnings only (unused-var, fast-refresh, exhaustive-deps) — no errors |
 
 The unit tests cover the OMM → TLE conversion against CelesTrak's own TLE
