@@ -28,7 +28,7 @@ import {
 } from './data/celestrak';
 import { Sgp4Client } from './data/sgp4Client';
 import { Sgp4Propagator } from './orbit/sgp4';
-import { SolarScene, SceneLabel } from './scene/SolarScene';
+import { SolarScene, SceneLabel, FlightProgressData } from './scene/SolarScene';
 import { BODY_INFO, EMPTY_FILTER, SatelliteFilter } from './scene/scale';
 import { regionOf } from './data/types';
 
@@ -57,6 +57,7 @@ import { LeftPanel, OriginState, DestinationState } from './ui/LeftPanel';
 import { Inspector, BodyInspectorData, SatInspectorData } from './ui/Inspector';
 import { DataPanel, SourceBlock } from './ui/DataPanel';
 import { TimeBar } from './ui/TimeBar';
+import { FlightSimulationHud } from './ui/FlightSimulationHud';
 import { Stat, Tag, fmt, fmtDuration, utc, utcShort } from './ui/common';
 
 const LAUNCH_SITES = [
@@ -121,6 +122,20 @@ export const App: React.FC = () => {
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [compare, setCompare] = useState<PlanResult[] | null>(null);
   const [planning, setPlanning] = useState(false);
+  const [flightState, setFlightState] = useState<FlightProgressData>({
+    active: false,
+    playing: false,
+    progress: 0,
+    stageIndex: 0,
+    totalStages: 0,
+    currentStageName: '',
+    traveledKm: 0,
+    totalKm: 0,
+    speedMs: 0,
+    completed: false,
+    followCamera: true,
+    speed: 1,
+  });
 
   // ── catalog UI ─────────────────────────────────────────────────────────
   const [filters, setFilters] = useState<SatelliteFilter>({
@@ -140,6 +155,8 @@ export const App: React.FC = () => {
   // ── traffic / D* ───────────────────────────────────────────────────────
   const [trafficRunning, setTrafficRunning] = useState(false);
   const [trafficSpeed, setTrafficSpeed] = useState(1);
+  const [trafficStartCell, setTrafficStartCell] = useState<[number, number, number]>(DSTAR_START_CELL);
+  const [trafficGoalCell, setTrafficGoalCell] = useState<[number, number, number]>(DSTAR_GOAL_CELL);
   const [dstarEvents, setDstarEvents] = useState<
     { type: string; message: string; timeSec: number; changedEdges?: number; expandedInRepair?: number; pathCost?: number }[]
   >([]);
@@ -238,6 +255,7 @@ export const App: React.FC = () => {
       setLeftTab('mission');
     };
     scene.onCameraChange = ({ scaleMode, focusBody }) => setScaleInfo({ mode: scaleMode, focus: focusBody });
+    scene.onFlightProgress = setFlightState;
     if (catalog.length > 0) scene.setCatalog(catalog, simDate);
     // Test/automation hook: lets browser checks read real scene state without
     // reaching into React internals.
@@ -509,7 +527,11 @@ export const App: React.FC = () => {
           sceneRef.current?.drawRoute(
             best.path.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z)),
             [],
-            destinationNode.kind === 'sat' ? 'earth' : 'helio',
+            // MissionGraph keeps every node Earth-centred, including bodies
+            // such as the Moon (heliocentric(body) − heliocentric(Earth)).
+            // Passing `helio` here shifts the lunar path by Earth's solar
+            // position and makes it appear to head toward the Sun.
+            'earth',
           );
         }
       } finally {
@@ -518,7 +540,166 @@ export const App: React.FC = () => {
     }, 16);
   }, [missionGraph, originNode, destinationNode, algorithm, keepOutKm]);
 
+  // ── flight simulation handler ──────────────────────────────────────────
+  const handleFlyTo = useCallback(
+    (customDest?: DestinationState) => {
+      let currentOrigin = origin;
+      if (!currentOrigin) {
+        currentOrigin = {
+          name: LAUNCH_SITES[0].name,
+          lat: LAUNCH_SITES[0].lat,
+          lon: LAUNCH_SITES[0].lon,
+          source: 'site',
+        };
+        setOrigin(currentOrigin);
+      }
+
+      const currentDest = customDest ?? destination;
+      if (!currentDest) return;
+
+      if (customDest && (!destination || destination.name !== customDest.name)) {
+        setDestination(customDest);
+      }
+
+      setMode('mission');
+      setLeftTab('mission');
+
+      // If we already have a calculated route that ends at this destination, run the simulation immediately!
+      if (
+        plan &&
+        plan.path.length >= 2 &&
+        (!customDest || plan.path[plan.path.length - 1].name === customDest.name)
+      ) {
+        sceneRef.current?.frameOrbitalRegion(55_000);
+        const pathPts = plan.path.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z));
+        const stageInfos = plan.path.map((n) => ({ name: n.name, positionKm: n.positionKm }));
+        sceneRef.current?.startFlightSimulation(pathPts, stageInfos, { speed: 1, followCamera: true });
+        return;
+      }
+
+      // Otherwise, construct origin & destination nodes, plan route, and launch flight simulation!
+      const origNode: MissionNode = {
+        id: `site:${currentOrigin.lat.toFixed(3)},${currentOrigin.lon.toFixed(3)}`,
+        name: currentOrigin.name,
+        kind: 'site',
+        positionKm: sitePositionKm(currentOrigin.lat, currentOrigin.lon),
+      };
+
+      let destNode: MissionNode;
+      if (currentDest.kind === 'satellite') {
+        const sat = catalog.find((o) => o.name === currentDest.name);
+        const alt = sat?.altitudeKm ?? 420;
+        const st = catalogStatesRef.current.get(sat?.noradId ?? -1);
+        destNode = {
+          id: `sat:${currentDest.id}`,
+          name: currentDest.name,
+          kind: 'sat',
+          noradId: sat?.noradId,
+          altitudeKm: alt,
+          positionKm: st ? { x: st.x, y: st.y, z: st.z } : sitePositionKm(0, 0, alt),
+        };
+      } else {
+        const st = ephem[currentDest.name];
+        const earth = ephem.Earth;
+        const pos =
+          st && earth
+            ? { x: st.position.x - earth.position.x, y: st.position.y - earth.position.y, z: st.position.z - earth.position.z }
+            : { x: 0, y: 0, z: 0 };
+        destNode = {
+          id: `body:${currentDest.name}`,
+          name: currentDest.name,
+          kind: currentDest.kind === 'moon' ? 'moon' : 'body',
+          positionKm: pos,
+        };
+      }
+
+      const graph = new MissionGraph({
+        origin: origNode,
+        destination: destNode,
+        bodies: Object.fromEntries(Object.entries(ephem).map(([k, v]) => [k, v.position])),
+        catalogStates: hazardStates,
+        cost: costModel(costModelId),
+        options: { keepOutKm },
+      });
+
+      setPlanning(true);
+      window.setTimeout(() => {
+        try {
+          const result = runPlan(graph, algorithm, origNode, destNode);
+          setPlan(result);
+          setCompare(null);
+
+          if (result.path.length >= 2) {
+            const pathPts = result.path.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z));
+            const exploredPts = result.explored.map((n) => new THREE.Vector3(n.positionKm.x, n.positionKm.y, n.positionKm.z));
+
+            sceneRef.current?.drawRoute(pathPts, exploredPts, 'earth', graph.hazards, keepOutKm);
+            sceneRef.current?.frameOrbitalRegion(55_000);
+
+            const stageInfos = result.path.map((n) => ({
+              name: n.name,
+              positionKm: n.positionKm,
+            }));
+
+            sceneRef.current?.startFlightSimulation(pathPts, stageInfos, {
+              speed: 1,
+              followCamera: true,
+            });
+          } else {
+            sceneRef.current?.clearRoute();
+            sceneRef.current?.stopFlightSimulation();
+          }
+        } finally {
+          setPlanning(false);
+        }
+      }, 16);
+    },
+    [origin, destination, plan, catalog, ephem, hazardStates, costModelId, keepOutKm, algorithm],
+  );
+
+  const handleSimPlayPause = useCallback(() => {
+    if (!sceneRef.current) return;
+    if (flightState.completed) {
+      sceneRef.current.resumeFlightSimulation();
+    } else if (flightState.playing) {
+      sceneRef.current.pauseFlightSimulation();
+    } else {
+      sceneRef.current.resumeFlightSimulation();
+    }
+  }, [flightState.playing, flightState.completed]);
+
+  const handleSimReplay = useCallback(() => {
+    sceneRef.current?.seekFlightSimulation(0);
+    sceneRef.current?.resumeFlightSimulation();
+  }, []);
+
+  const handleSimSeek = useCallback((t: number) => {
+    sceneRef.current?.seekFlightSimulation(t);
+  }, []);
+
+  const handleSimSpeed = useCallback((spd: number) => {
+    sceneRef.current?.setFlightSimulationSpeed(spd);
+  }, []);
+
+  const handleSimToggleFollow = useCallback(() => {
+    sceneRef.current?.setFlightSimulationFollowCamera(!flightState.followCamera);
+  }, [flightState.followCamera]);
+
+  const handleSimClose = useCallback(() => {
+    sceneRef.current?.stopFlightSimulation();
+  }, []);
+
   // ── traffic / D* ───────────────────────────────────────────────────────
+  const showDstarRoute = useCallback((dstar: DStarLite) => {
+    const cells = dstar
+      .path()
+      .filter((id) => id !== 'GOAL')
+      .map((id) => id.split(':').map(Number).slice(1) as [number, number, number]);
+    sceneRef.current?.drawCellPath(cells);
+    const current = cellCentre(DSTAR_GRID, ...dstar.currentCell());
+    sceneRef.current?.setTrafficVehicle(new THREE.Vector3(current.x, current.y, current.z));
+  }, []);
+
   const startDStar = useCallback(() => {
     const dstar = new DStarLite({
       grid: DSTAR_GRID,
@@ -538,8 +719,9 @@ export const App: React.FC = () => {
       );
     }
     dstar.epochMs = simDate.getTime();
-    const path = dstar.plan(DSTAR_START_CELL, DSTAR_GOAL_CELL);
+    const path = dstar.plan(trafficStartCell, trafficGoalCell);
     dstarRef.current = dstar;
+    showDstarRoute(dstar);
     setDstarEvents(dstar.events_.map((e) => ({ ...e })));
     setDstarReport({
       replans: 0,
@@ -551,7 +733,7 @@ export const App: React.FC = () => {
     });
     setDstarInitialSnapshot(dstar.snapshot());
     void subset;
-  }, [catalog, simDate]);
+  }, [catalog, simDate, showDstarRoute, trafficStartCell, trafficGoalCell]);
 
   /**
    * One traffic tick: objects advance, occupancy is re-propagated for the whole
@@ -581,14 +763,10 @@ export const App: React.FC = () => {
     const report = dstar.advance(uniq);
     dstar.lastChanged = uniq;
     // Show the repaired route through the occupancy grid.
-    const cells = dstar
-      .path()
-      .filter((id) => id !== 'GOAL')
-      .map((id) => id.split(':').map(Number).slice(1) as [number, number, number]);
-    sceneRef.current?.drawCellPath(cells);
+    showDstarRoute(dstar);
     setDstarReport({ ...report });
     setDstarEvents(dstar.events_.slice(-60).map((e) => ({ ...e })));
-  }, [catalog]);
+  }, [catalog, showDstarRoute]);
 
   const stepDStar = useCallback(() => {
     if (!dstarRef.current) startDStar();
@@ -598,9 +776,11 @@ export const App: React.FC = () => {
   const resetDStar = useCallback(() => {
     setDstarEvents([]);
     setDstarReport(null);
+    setDstarInitialSnapshot(null);
     dstarRef.current = null;
     dstarPropRef.current = null;
     sceneRef.current?.clearRoute();
+    sceneRef.current?.setTrafficVehicle(null);
   }, []);
 
   const stopTraffic = useCallback(() => {
@@ -910,6 +1090,7 @@ export const App: React.FC = () => {
               : null
           }
           onPlan={() => runPlanner(algorithm)}
+          onFlyTo={() => handleFlyTo()}
           onCompareAll={runCompare}
           planning={planning}
           catalogGroup={catalogGroup}
@@ -977,11 +1158,12 @@ export const App: React.FC = () => {
                 manoeuvreProbability: 0.18,
               });
               d.epochMs = snap.epochMs;
-              d.replay(snap, DSTAR_START_CELL, DSTAR_GOAL_CELL);
+              d.replay(snap, trafficStartCell, trafficGoalCell);
               // A deterministic replay also restores the simulation epoch.
               setSimDate(new Date(snap.epochMs));
               dstarPropRef.current = new Sgp4Propagator(catalog.slice(0, DSTAR_OBJECT_CAP));
               dstarRef.current = d;
+              showDstarRoute(d);
               setDstarEvents(d.events_.map((e) => ({ ...e })));
               setDstarReport({
                 replans: 0,
@@ -999,8 +1181,14 @@ export const App: React.FC = () => {
             events={dstarEvents}
             status={catalogStatus}
             grid={DSTAR_GRID}
-            startCell={DSTAR_START_CELL}
-            goalCell={DSTAR_GOAL_CELL}
+            startCell={trafficStartCell}
+            goalCell={trafficGoalCell}
+            onCells={(start, goal) => {
+              stopTraffic();
+              resetDStar();
+              setTrafficStartCell(start);
+              setTrafficGoalCell(goal);
+            }}
           />
         )}
 
@@ -1019,6 +1207,32 @@ export const App: React.FC = () => {
             setMode('mission');
           }}
           onTrack={() => selectedSat && sceneRef.current?.flyToSatellite(selectedSat)}
+          onFlyTo={() => {
+            if (selectedSat) {
+              const satDest: DestinationState = {
+                name: selectedSat.name,
+                kind: 'satellite',
+                id: String(selectedSat.noradId),
+                subtitle: `${regionOf(selectedSat.altitudeKm, selectedSat.inclinationDeg)} · NORAD ${selectedSat.noradId}`,
+                distanceKm: selectedSat.altitudeKm,
+              };
+              setDestinationFromScene(selectedSat.name, 'satellite', new THREE.Vector3());
+              handleFlyTo(satDest);
+            } else if (selectedBody) {
+              if (origin && destination) {
+                handleFlyTo();
+              } else {
+                const bodyDest: DestinationState = {
+                  name: selectedBody,
+                  kind: (BODY_INFO[selectedBody]?.kind === 'moon' ? 'moon' : 'planet') as 'moon' | 'planet',
+                  id: selectedBody,
+                  subtitle: BODY_INFO[selectedBody]?.kind ?? 'planet',
+                };
+                setDestinationFromScene(selectedBody, 'body', new THREE.Vector3());
+                handleFlyTo(bodyDest);
+              }
+            }
+          }}
         />
 
         <DataPanel
@@ -1049,8 +1263,21 @@ export const App: React.FC = () => {
             originName={origin?.name ?? '—'}
             destinationName={destination?.name ?? '—'}
             missionGraph={missionGraph}
+            onFlyTo={() => handleFlyTo()}
           />
         )}
+
+        <FlightSimulationHud
+          flight={flightState}
+          originName={origin?.name ?? 'Launch site'}
+          destinationName={destination?.name ?? 'Destination'}
+          onPlayPause={handleSimPlayPause}
+          onReplay={handleSimReplay}
+          onSeek={handleSimSeek}
+          onSpeed={handleSimSpeed}
+          onToggleFollow={handleSimToggleFollow}
+          onClose={handleSimClose}
+        />
 
         <div className="hints">
           Scroll = zoom · drag = orbit · shift/right-drag = pan · double-click = fly to
@@ -1070,7 +1297,8 @@ const PlanSummary: React.FC<{
   originName: string;
   destinationName: string;
   missionGraph: MissionGraph | null;
-}> = ({ plan, compare, graphVersion, costModel, originName, destinationName, missionGraph }) => {
+  onFlyTo?: () => void;
+}> = ({ plan, compare, graphVersion, costModel, originName, destinationName, missionGraph, onFlyTo }) => {
   return (
     <section
       aria-label="Route result"
@@ -1091,6 +1319,15 @@ const PlanSummary: React.FC<{
       <div style={{ fontSize: 10, color: 'var(--text-dim)' }}>
         {originName} → {destinationName}
       </div>
+      {plan.found && (
+        <button
+          className="btn btn-primary btn-block"
+          onClick={onFlyTo}
+          style={{ fontWeight: 700, padding: '6px 12px' }}
+        >
+          🚀 Fly route (Run simulation)
+        </button>
+      )}
       <div className="grid2">
         <Stat label="Cost" value={fmt(plan.metrics.pathCost, 1)} />
         <Stat label="Δv proxy" value={`${fmt(plan.metrics.deltaVTotalMs)} m/s`} color="var(--warn)" />
@@ -1186,9 +1423,39 @@ const TrafficPanel: React.FC<{
   grid: OrbitGridSpec;
   startCell: [number, number, number];
   goalCell: [number, number, number];
-}> = ({ running, onStart, onStop, onStep, onReset, onReplay, speed, onSpeed, counts, report, events, status, grid, startCell, goalCell }) => {
+  onCells: (start: [number, number, number], goal: [number, number, number]) => void;
+}> = ({ running, onStart, onStop, onStep, onReset, onReplay, speed, onSpeed, counts, report, events, status, grid, startCell, goalCell, onCells }) => {
   const startKm = cellCentre(grid, startCell[0], startCell[1], startCell[2]);
   const goalKm = cellCentre(grid, goalCell[0], goalCell[1], goalCell[2]);
+  const updateCell = (which: 'start' | 'goal', axis: 0 | 1 | 2, value: number) => {
+    const start = [...startCell] as [number, number, number];
+    const goal = [...goalCell] as [number, number, number];
+    (which === 'start' ? start : goal)[axis] = value;
+    onCells(start, goal);
+  };
+  const cellFields = (which: 'start' | 'goal', cell: [number, number, number]) => (
+    <div className="btn-row" style={{ alignItems: 'center' }}>
+      <strong style={{ minWidth: 76, fontSize: 10 }}>{which === 'start' ? 'Start cell' : 'Destination'}</strong>
+      {([
+        ['Band', grid.altBands],
+        ['Azimuth', grid.azSectors],
+        ['Polar', grid.polarSectors],
+      ] as const).map(([label, count], axis) => (
+        <label key={label} style={{ display: 'grid', gap: 2, fontSize: 9, color: 'var(--text-faint)' }}>
+          {label}
+          <select
+            aria-label={`${which} ${label.toLowerCase()}`}
+            value={cell[axis]}
+            disabled={running}
+            onChange={(e) => updateCell(which, axis as 0 | 1 | 2, Number(e.target.value))}
+            style={{ width: 76, padding: '4px 5px', color: 'var(--text)', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 5 }}
+          >
+            {Array.from({ length: count }, (_, i) => <option key={i} value={i}>{i}</option>)}
+          </select>
+        </label>
+      ))}
+    </div>
+  );
   return (
     <section className="traffic-panel" aria-label="Orbital traffic and D star Lite simulation">
       <strong style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--traffic)' }}>
@@ -1204,6 +1471,12 @@ const TrafficPanel: React.FC<{
         <br />
         <Tag label="educational model" kind="moon" /> Collision avoidance and transfer dynamics are
         simplified; this is not a conjunction assessment.
+      </div>
+      <div className="note" style={{ display: 'grid', gap: 8 }}>
+        <strong>Choose route endpoints</strong>
+        {cellFields('start', startCell)}
+        {cellFields('goal', goalCell)}
+        <span>Start simulation to plan between these cells and follow the D* Lite route.</span>
       </div>
       <div className="btn-row">
         <button className={running ? 'btn' : 'btn btn-traffic'} onClick={running ? onStop : onStart}>

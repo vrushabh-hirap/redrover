@@ -35,6 +35,7 @@ export interface InspectorProps {
   onFocus: () => void;
   onSetDestination: () => void;
   onTrack: () => void;
+  onFlyTo?: () => void;
 }
 
 export const Inspector: React.FC<InspectorProps> = ({
@@ -44,6 +45,7 @@ export const Inspector: React.FC<InspectorProps> = ({
   onFocus,
   onSetDestination,
   onTrack,
+  onFlyTo,
 }) => {
   if (!body && !sat) return null;
   return (
@@ -112,6 +114,7 @@ export const Inspector: React.FC<InspectorProps> = ({
             <dd>SGP4-propagated from catalog elements</dd>
           </dl>
           <div className="btn-row">
+            <button className="btn btn-primary" onClick={onFlyTo ?? onTrack}>🚀 Fly to</button>
             <button className="btn" onClick={onTrack}>Track</button>
             <button className="btn btn-warn" onClick={onSetDestination}>Set destination</button>
           </div>
@@ -120,7 +123,7 @@ export const Inspector: React.FC<InspectorProps> = ({
 
       {body && (
         <div className="btn-row">
-          <button className="btn" onClick={onFocus}>Fly to</button>
+          <button className="btn btn-primary" onClick={onFlyTo ?? onFocus}>🚀 Fly to</button>
           <button className="btn btn-warn" onClick={onSetDestination}>Set destination</button>
         </div>
       )}

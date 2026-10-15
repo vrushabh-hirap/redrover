@@ -61,6 +61,21 @@ export interface RouteSegment {
   to: THREE.Vector3;
 }
 
+export interface FlightProgressData {
+  active: boolean;
+  playing: boolean;
+  progress: number;
+  stageIndex: number;
+  totalStages: number;
+  currentStageName: string;
+  traveledKm: number;
+  totalKm: number;
+  speedMs: number;
+  completed: boolean;
+  followCamera: boolean;
+  speed: number;
+}
+
 const COLORS = {
   payload: 0x22d3ee,
   rocketBody: 0xfbbf24,
@@ -99,6 +114,7 @@ export class SolarScene {
   private satHalo: THREE.Mesh;
   private originMarker: THREE.Mesh;
   private destinationMarker: THREE.Mesh;
+  private trafficVehicle: THREE.Group;
   private routeGroup = new THREE.Group();
   private waypointGroup = new THREE.Group();
   private exploredPoints: THREE.Points | null = null;
@@ -144,6 +160,25 @@ export class SolarScene {
   onPickOrigin?: (lat: number, lon: number, label: string) => void;
   onPickDestination?: (name: string, kind: 'body' | 'satellite', posKm: THREE.Vector3) => void;
   onCameraChange?: (info: { scaleMode: ScaleMode; focusBody: string | null; distanceUnits: number; exaggeration: string }) => void;
+  onFlightProgress?: (progress: FlightProgressData) => void;
+
+  // ── flight simulation ──
+  private flightSimGroup!: THREE.Group;
+  private flightSimSpacecraft!: THREE.Group;
+  private flightSimPlume!: THREE.Group;
+  private flightSimTrail!: THREE.Line;
+  private flightSimBeacon!: THREE.Mesh;
+  private flightSimActive = false;
+  private flightSimPlaying = false;
+  private flightSimProgress = 0;
+  private flightSimSpeed = 1;
+  private flightSimFollowCamera = true;
+  private flightSimCompleted = false;
+  private flightSimLastTime = 0;
+  private flightSimCurve: THREE.Curve<THREE.Vector3> | null = null;
+  private flightSimStages: { name: string; positionKm: { x: number; y: number; z: number } }[] = [];
+  private flightSimTotalKm = 0;
+  private flightSimThrottle = 0;
 
   // ── runtime ──
   private rafId = 0;
@@ -188,11 +223,28 @@ export class SolarScene {
     this.buildOrbitLines();
     this.buildHelpers();
     this.buildSatelliteGroup();
+    this.buildFlightSimulationObjects();
 
     this.selectionHalo = this.makeHalo(COLORS.selection);
     this.satHalo = this.makeHalo(COLORS.satellite);
     this.originMarker = this.makeHalo(COLORS.origin);
     this.destinationMarker = this.makeHalo(COLORS.destination);
+
+    // A persistent vehicle marker is kept outside routeGroup because that
+    // group is rebuilt whenever D* Lite repairs its path.
+    this.trafficVehicle = new THREE.Group();
+    const vehicleBody = new THREE.Mesh(
+      new THREE.SphereGeometry(10, 12, 10),
+      new THREE.MeshBasicMaterial({ color: 0xfbbf24 }),
+    );
+    const vehicleNose = new THREE.Mesh(
+      new THREE.ConeGeometry(7, 18, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    );
+    vehicleNose.position.y = 13;
+    this.trafficVehicle.add(vehicleBody, vehicleNose);
+    this.trafficVehicle.visible = false;
+    this.scene.add(this.trafficVehicle);
 
     this.updateForDate(date);
     this.applyCamera();
@@ -979,12 +1031,304 @@ export class SolarScene {
     this.drawRoute(pts, [], 'earth');
   }
 
+  setTrafficVehicle(km: THREE.Vector3 | null): void {
+    if (!km) {
+      this.trafficVehicle.visible = false;
+      return;
+    }
+    const earthHelio = this.helio.get('Earth') ?? new THREE.Vector3();
+    const scene = this.scaleMode === 'overview'
+      ? (() => {
+          const helio = km.clone().add(earthHelio);
+          const r = helio.length();
+          return helio.multiplyScalar(overviewRadial(r) / Math.max(1e-9, r));
+        })()
+      : km.clone().multiplyScalar(this.kmPerUnit);
+    this.trafficVehicle.position.copy(scene);
+    this.trafficVehicle.visible = true;
+  }
+
   markOrigin(km: THREE.Vector3): void {
     this.positionHalo(this.originMarker, km);
   }
 
   markDestination(km: THREE.Vector3): void {
     this.positionHalo(this.destinationMarker, km);
+  }
+
+  // ── flight simulation ──────────────────────────────────────────────────────
+
+  private buildFlightSimulationObjects(): void {
+    this.flightSimGroup = new THREE.Group();
+
+    // Spacecraft root
+    this.flightSimSpacecraft = new THREE.Group();
+
+    // Command module (capsule cone)
+    const cmGeom = new THREE.ConeGeometry(3.6, 7.5, 12);
+    const cmMat = new THREE.MeshStandardMaterial({
+      color: 0xf1f5f9,
+      roughness: 0.25,
+      metalness: 0.85,
+    });
+    const cm = new THREE.Mesh(cmGeom, cmMat);
+    cm.position.y = 3.5;
+
+    // Service module (cylinder)
+    const smGeom = new THREE.CylinderGeometry(3.2, 3.2, 5, 12);
+    const smMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      roughness: 0.45,
+      metalness: 0.65,
+    });
+    const sm = new THREE.Mesh(smGeom, smMat);
+    sm.position.y = -2;
+
+    // Solar panel wings (left and right)
+    const panelGeom = new THREE.BoxGeometry(16, 0.35, 3.2);
+    const panelMat = new THREE.MeshStandardMaterial({
+      color: 0x1d4ed8,
+      roughness: 0.2,
+      metalness: 0.5,
+      emissive: 0x0c4a6e,
+      emissiveIntensity: 0.4,
+    });
+    const panels = new THREE.Mesh(panelGeom, panelMat);
+    panels.position.y = -2;
+
+    // Engine thruster nozzle
+    const nozzleGeom = new THREE.CylinderGeometry(1.0, 2.2, 1.8, 10);
+    const nozzleMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.8,
+      metalness: 0.3,
+    });
+    const nozzle = new THREE.Mesh(nozzleGeom, nozzleMat);
+    nozzle.position.y = -5;
+
+    // Thruster flame plume
+    const flameGeom = new THREE.ConeGeometry(2.0, 8.5, 12);
+    flameGeom.rotateX(Math.PI); // Point downward behind engine
+    const flameMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.85,
+      blending: THREE.AdditiveBlending,
+    });
+    const flame = new THREE.Mesh(flameGeom, flameMat);
+    flame.position.y = -10;
+
+    // Core flame
+    const coreGeom = new THREE.ConeGeometry(1.0, 5, 8);
+    coreGeom.rotateX(Math.PI);
+    const coreMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+    });
+    const core = new THREE.Mesh(coreGeom, coreMat);
+    core.position.y = -8.5;
+
+    const thrusterLight = new THREE.PointLight(0x38bdf8, 2.5, 35);
+    thrusterLight.position.y = -7;
+
+    this.flightSimPlume = new THREE.Group();
+    this.flightSimPlume.add(flame, core, thrusterLight);
+
+    this.flightSimSpacecraft.add(cm, sm, panels, nozzle, this.flightSimPlume);
+    this.flightSimSpacecraft.scale.set(0.65, 0.65, 0.65);
+
+    // Dynamic traveled trail line
+    const trailGeom = new THREE.BufferGeometry();
+    const trailMat = new THREE.LineBasicMaterial({
+      color: 0x06b6d4,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    });
+    this.flightSimTrail = new THREE.Line(trailGeom, trailMat);
+
+    // Arrival destination beacon
+    const beaconGeom = new THREE.RingGeometry(1.5, 5.5, 24);
+    const beaconMat = new THREE.MeshBasicMaterial({
+      color: 0x22c55e,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    this.flightSimBeacon = new THREE.Mesh(beaconGeom, beaconMat);
+    this.flightSimBeacon.visible = false;
+
+    this.flightSimGroup.add(this.flightSimTrail, this.flightSimBeacon, this.flightSimSpacecraft);
+    this.flightSimGroup.visible = false;
+    this.scene.add(this.flightSimGroup);
+  }
+
+  private updateFlightSimTrail(t: number): void {
+    if (!this.flightSimCurve) return;
+    const numSamples = Math.max(2, Math.floor(t * 60));
+    const pts: THREE.Vector3[] = [];
+    for (let i = 0; i <= numSamples; i++) {
+      const sampleT = (i / numSamples) * t;
+      pts.push(this.flightSimCurve.getPointAt(sampleT));
+    }
+    this.flightSimTrail.geometry.dispose();
+    this.flightSimTrail.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+  }
+
+  startFlightSimulation(
+    pathKm: THREE.Vector3[],
+    stages: { name: string; positionKm: { x: number; y: number; z: number } }[],
+    options?: { speed?: number; followCamera?: boolean },
+  ): void {
+    if (pathKm.length < 2) return;
+    this.flightSimStages = stages;
+    this.flightSimSpeed = options?.speed ?? 1;
+    this.flightSimFollowCamera = options?.followCamera ?? true;
+    this.flightSimProgress = 0;
+    this.flightSimPlaying = true;
+    this.flightSimCompleted = false;
+    this.flightSimActive = true;
+    this.flightSimLastTime = Date.now();
+
+    const earthHelio = this.helio.get('Earth') ?? new THREE.Vector3();
+    const toScene = (p: THREE.Vector3) => {
+      if (this.scaleMode === 'overview') {
+        const helio = p.clone().add(earthHelio);
+        const r = helio.length();
+        return helio.multiplyScalar(overviewRadial(r) / Math.max(1e-9, r));
+      }
+      return p.clone().multiplyScalar(this.kmPerUnit);
+    };
+
+    const scenePts = pathKm.map(toScene);
+    if (scenePts.length === 2) {
+      this.flightSimCurve = new THREE.LineCurve3(scenePts[0], scenePts[1]);
+    } else {
+      this.flightSimCurve = new THREE.CatmullRomCurve3(scenePts, false, 'catmullrom', 0.25);
+    }
+
+    let distKm = 0;
+    for (let i = 0; i < pathKm.length - 1; i++) {
+      distKm += pathKm[i].distanceTo(pathKm[i + 1]);
+    }
+    this.flightSimTotalKm = distKm;
+
+    this.flightSimGroup.visible = true;
+    this.flightSimSpacecraft.visible = true;
+    this.updateFlightSimTrail(0);
+
+    const initPos = this.flightSimCurve.getPointAt(0);
+    this.flightSimSpacecraft.position.copy(initPos);
+
+    if (this.flightSimFollowCamera) {
+      this.camTargetGoal.copy(initPos);
+      this.camDistGoal = Math.max(90, this.bodyVisualUnits(this.focusBody ?? 'Earth') * 0.65);
+      this.clampDistances();
+      this.flying = true;
+    }
+
+    this.emitFlightSimProgress();
+  }
+
+  pauseFlightSimulation(): void {
+    this.flightSimPlaying = false;
+    this.emitFlightSimProgress();
+  }
+
+  resumeFlightSimulation(): void {
+    if (this.flightSimCompleted) {
+      this.flightSimProgress = 0;
+      this.flightSimCompleted = false;
+    }
+    this.flightSimPlaying = true;
+    this.flightSimLastTime = Date.now();
+    this.emitFlightSimProgress();
+  }
+
+  seekFlightSimulation(progress: number): void {
+    this.flightSimProgress = THREE.MathUtils.clamp(progress, 0, 1);
+    if (this.flightSimProgress < 1) {
+      this.flightSimCompleted = false;
+    }
+    if (this.flightSimCurve) {
+      const pos = this.flightSimCurve.getPointAt(this.flightSimProgress);
+      this.flightSimSpacecraft.position.copy(pos);
+      const tangent = this.flightSimCurve.getTangentAt(Math.min(0.999, Math.max(0.001, this.flightSimProgress))).normalize();
+      this.flightSimSpacecraft.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tangent);
+      this.updateFlightSimTrail(this.flightSimProgress);
+    }
+    this.emitFlightSimProgress();
+  }
+
+  setFlightSimulationSpeed(speed: number): void {
+    this.flightSimSpeed = speed;
+    this.emitFlightSimProgress();
+  }
+
+  setFlightSimulationFollowCamera(follow: boolean): void {
+    this.flightSimFollowCamera = follow;
+    this.emitFlightSimProgress();
+  }
+
+  stopFlightSimulation(): void {
+    this.flightSimActive = false;
+    this.flightSimPlaying = false;
+    this.flightSimProgress = 0;
+    this.flightSimGroup.visible = false;
+    this.emitFlightSimProgress();
+  }
+
+  isFlightSimulationActive(): boolean {
+    return this.flightSimActive;
+  }
+
+  private emitFlightSimProgress(): void {
+    if (!this.onFlightProgress) return;
+    if (!this.flightSimActive) {
+      this.onFlightProgress({
+        active: false,
+        playing: false,
+        progress: 0,
+        stageIndex: 0,
+        totalStages: 0,
+        currentStageName: '',
+        traveledKm: 0,
+        totalKm: 0,
+        speedMs: 0,
+        completed: false,
+        followCamera: this.flightSimFollowCamera,
+        speed: this.flightSimSpeed,
+      });
+      return;
+    }
+
+    const t = this.flightSimProgress;
+    const stages = this.flightSimStages;
+    const totalStages = Math.max(1, stages.length - 1);
+    const stageIdx = Math.min(totalStages - 1, Math.floor(t * totalStages));
+    const stageFrom = stages[stageIdx]?.name ?? 'Start';
+    const stageTo = stages[stageIdx + 1]?.name ?? stages[stages.length - 1]?.name ?? 'Destination';
+    const currentStageName = `${stageFrom} → ${stageTo}`;
+    const traveledKm = t * this.flightSimTotalKm;
+    const speedMs = this.flightSimCompleted ? 0 : Math.round(7600 + Math.sin(t * Math.PI) * 2800);
+
+    this.onFlightProgress({
+      active: true,
+      playing: this.flightSimPlaying,
+      progress: t,
+      stageIndex: stageIdx,
+      totalStages,
+      currentStageName,
+      traveledKm,
+      totalKm: this.flightSimTotalKm,
+      speedMs,
+      completed: this.flightSimCompleted,
+      followCamera: this.flightSimFollowCamera,
+      speed: this.flightSimSpeed,
+    });
   }
 
   private positionHalo(halo: THREE.Mesh, km: THREE.Vector3): void {
@@ -1301,6 +1645,62 @@ export class SolarScene {
       this.satHalo.visible = false;
     }
 
+    // Advance flight simulation if active
+    if (this.flightSimActive && this.flightSimCurve) {
+      if (this.flightSimPlaying && !this.flightSimCompleted) {
+        // Base duration: 16 seconds at 1x
+        const dt = THREE.MathUtils.clamp((Date.now() - this.flightSimLastTime) / 1000, 0, 0.1);
+        this.flightSimLastTime = Date.now();
+        this.flightSimProgress += dt * (1 / 16) * this.flightSimSpeed;
+        if (this.flightSimProgress >= 1) {
+          this.flightSimProgress = 1;
+          this.flightSimCompleted = true;
+          this.flightSimPlaying = false;
+        }
+      } else {
+        this.flightSimLastTime = Date.now();
+      }
+
+      const t = this.flightSimProgress;
+      const pos = this.flightSimCurve.getPointAt(t);
+      const tangent = this.flightSimCurve.getTangentAt(Math.min(0.999, Math.max(0.001, t))).normalize();
+
+      this.flightSimSpacecraft.position.copy(pos);
+      const up = new THREE.Vector3(0, 1, 0);
+      this.flightSimSpacecraft.quaternion.setFromUnitVectors(up, tangent);
+
+      if (this.flightSimPlaying && !this.flightSimCompleted) {
+        this.flightSimPlume.visible = true;
+        const pulse = 0.85 + Math.sin(Date.now() * 0.03) * 0.25;
+        this.flightSimPlume.scale.set(1, pulse, 1);
+      } else {
+        this.flightSimPlume.visible = false;
+      }
+
+      this.updateFlightSimTrail(t);
+
+      if (this.flightSimCompleted) {
+        this.flightSimBeacon.position.copy(pos);
+        this.flightSimBeacon.quaternion.copy(this.camera.quaternion);
+        const beaconPulse = 1.0 + Math.sin(Date.now() * 0.008) * 0.3;
+        this.flightSimBeacon.scale.set(beaconPulse, beaconPulse, beaconPulse);
+        this.flightSimBeacon.visible = true;
+      } else {
+        this.flightSimBeacon.visible = false;
+      }
+
+      if (this.flightSimFollowCamera) {
+        this.camTargetGoal.lerp(pos, 0.2);
+        const desiredDist = Math.max(90, this.bodyVisualUnits(this.focusBody ?? 'Earth') * 0.65);
+        this.camDistGoal += (desiredDist - this.camDistGoal) * 0.08;
+      }
+
+      this.flightSimThrottle++;
+      if (this.flightSimThrottle % 4 === 0 || this.flightSimCompleted) {
+        this.emitFlightSimProgress();
+      }
+    }
+
     this.renderer.render(this.scene, this.camera);
     this.applyBodyVisibility();
 
@@ -1314,6 +1714,10 @@ export class SolarScene {
   dispose(): void {
     this.disposed = true;
     cancelAnimationFrame(this.rafId);
+    if (this.flightSimTrail) {
+      this.flightSimTrail.geometry.dispose();
+      (this.flightSimTrail.material as THREE.Material).dispose();
+    }
     window.removeEventListener('resize', this.onResize);
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.renderer.dispose();

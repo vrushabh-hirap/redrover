@@ -72,6 +72,22 @@ describe('D* Lite on the time-expanded orbital graph', () => {
     expect(r.replans).toBe(0);
   });
 
+  it('plans from the selected cells and advances the vehicle along that route', () => {
+    const d = new DStarLite({ seed: 23, manoeuvreProbability: 0, grid: { timeSteps: 20, stepSec: 300 } });
+    const start: [number, number, number] = [2, 3, 2];
+    const goal: [number, number, number] = [6, 12, 4];
+    const planned = d.plan(start, goal);
+
+    expect(planned[0]).toBe(`0:${start.join(':')}`);
+    expect(planned.at(-1)).toBe('GOAL');
+    expect(planned.length).toBeGreaterThan(2);
+
+    const nextCell = planned[1].split(':').map(Number).slice(1) as [number, number, number];
+    d.advance([]);
+    expect(d.currentCell()).toEqual(nextCell);
+    expect(d.path().at(-1)).toBe('GOAL');
+  });
+
   it('restores a snapshot deterministically', () => {
     const a = new DStarLite({ seed: 11, manoeuvreProbability: 0 });
     a.plan([3, 2, 3], [6, 10, 3]);

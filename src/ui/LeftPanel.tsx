@@ -48,6 +48,7 @@ export interface LeftPanelProps {
   keepOutChoices: number[];
   hazardInfo: { screened: number; blockedEdges: number; graphEdges: number } | null;
   onPlan: () => void;
+  onFlyTo: () => void;
   onCompareAll: () => void;
   planning: boolean;
   // catalog
@@ -283,11 +284,20 @@ export const LeftPanel: React.FC<LeftPanelProps> = (p) => {
             </div>
 
             <div className="btn-row">
-              <button className="btn btn-primary" onClick={p.onPlan} disabled={p.planning || !p.origin || !p.destination}>
-                {p.planning ? 'Planning…' : 'Plan route'}
+              <button
+                className="btn btn-primary"
+                onClick={p.onFlyTo}
+                disabled={p.planning || !p.origin || !p.destination}
+                style={{ flex: 1.2, fontWeight: 700 }}
+                title="Plan route and simulate spacecraft flight"
+              >
+                {p.planning ? 'Planning…' : '🚀 Fly to'}
+              </button>
+              <button className="btn" onClick={p.onPlan} disabled={p.planning || !p.origin || !p.destination}>
+                Plan route
               </button>
               <button className="btn" onClick={p.onCompareAll} disabled={p.planning || !p.origin || !p.destination}>
-                Compare all
+                Compare
               </button>
             </div>
             <div className="note warn">
